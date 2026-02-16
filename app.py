@@ -8,178 +8,155 @@ from datetime import datetime
 
 st.set_page_config(page_title="NASCAR DFS Optimizer 2026", layout="wide")
 st.title("🏁 NASCAR DFS Optimizer: All Tracks (2026)")
-st.markdown("**Live data from Racing-Reference • DK/FD support • Track-specific projections & optimizer**")
+st.markdown("Live RR data • DK/FD support • Projections & PuLP optimizer")
 
-# --- DATA PIPELINE (Auto-Updating) ---
-@st.cache_data(ttl=3600)  # Refresh hourly
+# --- HELPERS ---
+def safe_read_html(url, desc="data"):
+    try:
+        return pd.read_html(requests.get(url, timeout=15).text)
+    except Exception as e:
+        st.warning(f"Failed to load {desc} from {url}: {str(e)}")
+        return []
+
+# --- DATA ---
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_schedule():
     url = "https://www.racing-reference.info/season-stats/2026/W"
-    try:
-        df = pd.read_html(requests.get(url).text)[0]
-        return df[['Date', 'Race', 'Track']].dropna(how='all')
-    except:
-        return pd.DataFrame({'Date': [], 'Race': ['No schedule loaded'], 'Track': []})
+    tables = safe_read_html(url, "2026 schedule")
+    if tables and len(tables) > 0:
+        df = tables[0]
+        if 'Date' in df.columns and 'Track' in df.columns:
+            return df[['Date', 'Race', 'Track']].dropna(how='all')
+    return pd.DataFrame({'Date': [], 'Race': ['Fallback: No schedule'], 'Track': ['Unknown']})
 
-@st.cache_data(ttl=7200)
-def get_track_history(track_name):
-    # Fallback: use most recent superspeedway or similar for demo; expand later
-    # In production: map track → recent race URL or search RR
-    recent_race_urls = [
-        "https://www.racing-reference.info/race-results/2026_Daytona_500/W",  # Update as needed
+@st.cache_data(ttl=7200, show_spinner=False)
+def get_track_history(_track_name):  # _ to allow cache per track if expanded
+    recent_urls = [
+        "https://www.racing-reference.info/race-results/2026-01/W",  # Daytona example; update as races happen
         "https://www.racing-reference.info/race-results/2025_Daytona_500/W",
+        "https://www.racing-reference.info/race-results/2025_Coke_Zero_Sugar_400/W",
     ]
-    all_data = []
-    for url in recent_race_urls[:3]:  # Limit to avoid overload
-        try:
-            df = pd.read_html(requests.get(url).text)[0]
-            if 'Driver' in df.columns and 'Finish' in df.columns:
-                df = df[['Driver', 'Start', 'Finish', 'Laps', 'Led', 'Status']].copy()
-                df['Race'] = url.split('/')[-2]
-                all_data.append(df)
-        except:
-            pass
-    if not all_data:
+    all_dfs = []
+    for url in recent_urls:
+        tables = safe_read_html(url, "race history")
+        if tables and len(tables) > 0:
+            df = tables[0]
+            needed = ['Driver', 'Start', 'Finish', 'Laps', 'Led']
+            if all(col in df.columns for col in needed[:3]):  # at least basics
+                df = df[needed + ['Status'] if 'Status' in df.columns else needed].copy()
+                all_dfs.append(df)
+    if not all_dfs:
         return pd.DataFrame()
-    hist = pd.concat(all_data, ignore_index=True)
-    hist['Avg_Finish'] = hist.groupby('Driver')['Finish'].transform('mean')
-    hist['Laps_Led_Pct'] = hist.groupby('Driver')['Led'].transform('mean') / hist.groupby('Driver')['Laps'].transform('mean').replace(0, 1)
+    hist = pd.concat(all_dfs, ignore_index=True)
+    if 'Driver' not in hist.columns or hist.empty:
+        return pd.DataFrame()
+    hist['Avg_Finish'] = hist.groupby('Driver', group_keys=False)['Finish'].transform('mean')
+    hist['Laps_Led_Pct'] = (
+        hist.groupby('Driver', group_keys=False)['Led'].transform('mean') /
+        hist.groupby('Driver', group_keys=False)['Laps'].transform('mean').replace(0, 1)
+    )
     proj = hist[['Driver', 'Avg_Finish', 'Laps_Led_Pct']].drop_duplicates()
     proj['DK_Proj_Base'] = (41 - proj['Avg_Finish'].clip(1, 40)) * 1.5 + proj['Laps_Led_Pct'] * 25
     return proj
 
 def get_track_type(track):
+    if not isinstance(track, str): return 'intermediate'
     superspeed = ['Daytona', 'Talladega']
-    short = ['Bristol', 'Martinsville', 'Richmond']
-    road = ['Circuit of The Americas', 'Sonoma', 'Watkins Glen', 'Road America']
     if any(s in track for s in superspeed): return 'superspeedway'
-    if any(s in track for s in short): return 'short'
-    if any(s in track for s in road): return 'road'
-    return 'intermediate'
+    return 'intermediate'  # simplify for now
 
-# --- SIDEBAR: SELECT RACE ---
+# --- UI ---
 schedule = get_schedule()
-st.sidebar.header("Select Race / Track")
+st.sidebar.header("Race Selection")
 if not schedule.empty:
-    race_options = schedule['Race'].astype(str) + " @ " + schedule['Track'].astype(str)
-    selected = st.sidebar.selectbox("Race", race_options)
-    idx = race_options.tolist().index(selected)
+    race_options = [f"{r} @ {t}" for r, t in zip(schedule['Race'], schedule['Track'])]
+    selected = st.sidebar.selectbox("Choose Race", race_options, index=0)
+    idx = race_options.index(selected)
     race = schedule.iloc[idx]['Race']
     track = schedule.iloc[idx]['Track']
 else:
-    race, track = "Upcoming Race", "Unknown Track"
-    st.sidebar.warning("Schedule scrape failed – using fallback")
+    race, track = "No race data", "Unknown"
+    st.sidebar.warning("Could not load schedule – using fallback mode")
 
 track_type = get_track_type(track)
-st.sidebar.success(f"**{race} at {track}** ({track_type.capitalize()}) • Refreshed: {datetime.now().strftime('%H:%M %Z')}")
+st.sidebar.success(f"**{race} @ {track}** • ({track_type}) • {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-# --- PROJECTIONS ---
-st.header("📊 Driver Projections")
+# Projections
+st.header("Driver Projections (Recent History)")
 hist = get_track_history(track)
 if not hist.empty:
-    st.dataframe(
-        hist.sort_values('DK_Proj_Base', ascending=False).head(20)[['Driver', 'Avg_Finish', 'Laps_Led_Pct', 'DK_Proj_Base']],
-        use_container_width=True,
-        column_config={"DK_Proj_Base": "Base DK Proj"}
-    )
-    fig = px.bar(hist.nlargest(15, 'DK_Proj_Base'), x='Driver', y='DK_Proj_Base', title=f"Top 15 Projections – {track}")
+    st.dataframe(hist.sort_values('DK_Proj_Base', ascending=False).head(20), use_container_width=True)
+    fig = px.bar(hist.nlargest(15, 'DK_Proj_Base'), x='Driver', y='DK_Proj_Base', title="Top Projections")
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("No historical data loaded yet for this track – projections will use defaults after salary upload.")
+    st.info("No recent race history loaded – projections will use neutral defaults after upload.")
 
-# --- SALARY UPLOAD ---
-st.header("💰 Upload Current Salaries")
-col1, col2 = st.columns(2)
-with col1:
-    dk_file = st.file_uploader("DraftKings CSV Export", type="csv", key="dk")
-with col2:
-    fd_file = st.file_uploader("FanDuel CSV Export", type="csv", key="fd")
+# Upload
+st.header("Upload Salaries (DK or FD)")
+dk_file = st.file_uploader("DraftKings CSV", type="csv")
+fd_file = st.file_uploader("FanDuel CSV", type="csv")
 
 salaries = None
-site = None
 salary_cap = 50000
 if dk_file:
     salaries = pd.read_csv(dk_file)
-    site = "DraftKings"
+    salaries = salaries.rename(columns={'Name': 'Driver', 'Roster Position': 'Position'})
+    salary_cap = 50000
 elif fd_file:
     salaries = pd.read_csv(fd_file)
-    site = "FanDuel"
-    salary_cap = 60000  # FD typical cap; confirm per slate
+    salaries = salaries.rename(columns={'Player Name': 'Driver'})
+    salary_cap = 60000
 
 if salaries is not None:
-    st.success(f"Loaded {len(salaries)} drivers from {site}")
-    # Assume columns: Name/Driver, Salary, maybe Position (all DRV), maybe Team/Manufacturer
-    salaries = salaries.rename(columns={'Name': 'Driver'})  # DK uses 'Name'
-    salaries = salaries.merge(hist, on='Driver', how='left').fillna({'Avg_Finish': 20, 'Laps_Led_Pct': 0, 'DK_Proj_Base': 25})
-    
-    # Final proj adjustments
-    multiplier = 1.3 if track_type == 'superspeedway' else 1.0 if track_type == 'intermediate' else 0.85
-    salaries['Final_Proj'] = salaries['DK_Proj_Base'] * multiplier
-    
+    st.success(f"Loaded {len(salaries)} drivers")
+    salaries = salaries.merge(hist, on='Driver', how='left').fillna({'DK_Proj_Base': 20, 'Avg_Finish': 20})
+    mult = 1.3 if track_type == 'superspeedway' else 1.0
+    salaries['Final_Proj'] = salaries['DK_Proj_Base'] * mult
     st.dataframe(salaries[['Driver', 'Salary', 'Final_Proj']].sort_values('Final_Proj', ascending=False).head(15),
                  use_container_width=True)
 
-# --- OPTIMIZER ---
-st.header("⚙️ PuLP Lineup Optimizer")
-if salaries is not None and not salaries.empty:
-    num_lineups = st.slider("Number of lineups to generate (1 = single optimal)", 1, 150, 30)
-    max_per_team = st.slider("Max drivers per team (stack control)", 2, 6, 4)
-
-    if st.button("🚀 Generate Lineups", type="primary"):
-        with st.spinner(f"Running PuLP optimizer ({num_lineups} lineups)..."):
+# Optimizer
+st.header("Lineup Optimizer")
+if salaries is not None and 'Driver' in salaries.columns and 'Salary' in salaries.columns and 'Final_Proj' in salaries.columns:
+    num_lineups = st.slider("Lineups (1 = best only)", 1, 50, 10)
+    if st.button("Generate Lineups"):
+        with st.spinner("Optimizing..."):
             lineups = []
-            base_prob = salaries['Final_Proj'].copy()
-
+            base_proj = salaries['Final_Proj'].copy()
             for i in range(num_lineups):
-                # Slight perturbation for GPP diversity
+                proj_col = 'Final_Proj' if i == 0 else 'Perturbed'
                 if i > 0:
-                    perturbation = np.random.normal(1.0, 0.12, len(salaries))
-                    salaries['Perturbed_Proj'] = base_prob * perturbation
+                    salaries[proj_col] = base_proj * np.random.normal(1.0, 0.10, len(salaries))
                 else:
-                    salaries['Perturbed_Proj'] = base_prob
+                    salaries[proj_col] = base_proj
 
-                prob = pulp.LpProblem(f"NASCAR_DFS_{i}", pulp.LpMaximize)
+                prob = pulp.LpProblem("DFS", pulp.LpMaximize)
+                select = {d: pulp.LpVariable(f"s_{d}", 0, 1, pulp.LpBinary) for d in salaries['Driver']}
 
-                select = pulp.LpVariable.dicts("select", salaries['Driver'], 0, 1, pulp.LpBinary)
-
-                prob += pulp.lpSum(select[d] * salaries[salaries['Driver'] == d]['Perturbed_Proj'].iloc[0]
-                                   for d in salaries['Driver'])
-
+                prob += pulp.lpSum(select[d] * salaries[salaries['Driver'] == d][proj_col].iloc[0] for d in select)
                 prob += pulp.lpSum(select.values()) == 6
+                prob += pulp.lpSum(select[d] * salaries[salaries['Driver'] == d]['Salary'].iloc[0] for d in select) <= salary_cap
 
-                prob += pulp.lpSum(select[d] * salaries[salaries['Driver'] == d]['Salary'].iloc[0]
-                                   for d in salaries['Driver']) <= salary_cap
-
-                # Team stack limit (if 'Team' column exists)
-                if 'Team' in salaries.columns:
-                    for team, grp in salaries.groupby('Team'):
-                        prob += pulp.lpSum(select[d] for d in grp['Driver']) <= max_per_team
-
-                # Optional superspeedway manufacturer min (if column exists)
-                if track_type == 'superspeedway' and 'Manufacturer' in salaries.columns:
-                    for mfr, grp in salaries.groupby('Manufacturer'):
-                        prob += pulp.lpSum(select[d] for d in grp['Driver']) >= 2, f"Min2_{mfr}"
-
-                prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=10 + i*2))
-
-                if pulp.LpStatus[prob.status] == 'Optimal':
-                    selected = [d for d in select if select[d].value() > 0.5]
-                    pts = sum(salaries[salaries['Driver'] == d]['Perturbed_Proj'].iloc[0] for d in selected)
-                    sal_total = sum(salaries[salaries['Driver'] == d]['Salary'].iloc[0] for d in selected)
-                    lineups.append({
-                        'Lineup': ', '.join(selected),
-                        'Proj_Pts': round(pts, 1),
-                        'Salary': int(sal_total),
-                        'Variant': i+1
-                    })
+                try:
+                    prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=8))
+                    if prob.status == 1:
+                        sel = [d for d in select if select[d].value() > 0.5]
+                        pts = sum(salaries[salaries['Driver'] == d][proj_col].iloc[0] for d in sel)
+                        sal = sum(salaries[salaries['Driver'] == d]['Salary'].iloc[0] for d in sel)
+                        lineups.append({'Lineup': ', '.join(sel), 'Proj': round(pts,1), 'Salary': int(sal)})
+                except Exception as e:
+                    st.warning(f"Optimizer error on variant {i+1}: {str(e)}")
 
             if lineups:
-                df_lineups = pd.DataFrame(lineups).sort_values('Proj_Pts', ascending=False)
-                st.dataframe(df_lineups, use_container_width=True)
-                st.download_button("Download Lineups CSV", df_lineups.to_csv(index=False), "nascar_lineups.csv")
+                df = pd.DataFrame(lineups).sort_values('Proj', ascending=False)
+                st.dataframe(df, use_container_width=True)
+                st.download_button("Download CSV", df.to_csv(index=False), "lineups.csv")
             else:
-                st.error("No valid lineups found – check salary cap or relax team limits.")
+                st.error("No lineups generated – check salaries/projections or try fewer variants.")
+else:
+    st.info("Upload a salary CSV to enable optimizer.")
 
-st.sidebar.markdown("---")
-st.sidebar.info("Upload DK/FD CSV after qualifying for best results.\n"
-                "Projections use recent history + track adjustments.\n"
-                "Pure PuLP – no external optimizer libs needed.")
+with st.expander("Debug Info"):
+    st.write(f"Schedule rows: {len(schedule)}")
+    st.write(f"History rows: {len(hist)}")
+    st.write(f"Salaries loaded: {'Yes' if salaries is not None else 'No'}")
