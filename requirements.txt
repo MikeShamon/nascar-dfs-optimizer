@@ -2,7 +2,6 @@ streamlit
 pandas
 requests
 beautifulsoup4
-pulp
-pydfs-lineup-optimizer
 numpy
 plotly
+pulp
